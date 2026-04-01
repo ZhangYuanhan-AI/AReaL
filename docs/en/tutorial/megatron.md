@@ -27,6 +27,87 @@ expert modules use TP=1 and EP=4. See
 [MoE Parallel Folding](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/transformer/moe#moe-parallel-folding)
 for details on this feature.
 
+### MUST KNOW: MoE Parallel Folding
+
+MoE Parallel Folding is a Megatron-Core feature that **allows attention layers and expert
+(FFN) layers within the same Transformer block to use different parallelism strategies on
+the same set of GPUs**. Understanding this concept is essential for efficiently training
+large MoE models.
+
+#### Why It Matters
+
+In a standard (non-folded) setup, all layers in a Transformer block share one parallelism
+configuration. This creates a problem for MoE models:
+
+- **Attention layers** benefit from Context Parallelism (CP) to handle long sequences, but
+  do not have experts.
+- **Expert FFN layers** benefit from Expert Parallelism (EP) to distribute experts across
+  GPUs, but do not need CP.
+
+Without folding, you would need `DP × TP × PP × CP × EP` GPUs—the product of *all*
+dimensions—which quickly becomes prohibitive. For example, CP=2 and EP=4 alone would
+require 8× more GPUs than a single replica.
+
+Parallel folding solves this by **reusing the same GPU mesh for both module types with
+different dimension mappings**, so the total GPU count is determined by the *larger* of the
+two configurations, not their product.
+
+#### How It Works
+
+With the hybrid syntax, you specify independent parallelism for attention (`attn`) and FFN
+(`ffn`) modules:
+
+```
+megatron:(attn:<attn_dims>|ffn:<ffn_dims>)
+```
+
+The GPUs allocated to CP in the attention section are **repurposed** for EP (and/or
+different TP) in the FFN section. Concretely:
+
+| Syntax                                         | Attention GPUs      | FFN GPUs            | Total GPUs |
+| ---------------------------------------------- | ------------------- | ------------------- | ---------- |
+| `megatron:(attn:d1p4t2c2\|ffn:d1p4t1e4)`      | DP=1, PP=4, TP=2, CP=2 | DP=1, PP=4, TP=1, EP=4 | **16**     |
+| Without folding: `megatron:d1p4t2c2e4`         | —                   | —                   | **64**     |
+
+By folding, the 16-GPU mesh serves **both** roles—CP=2 for attention and EP=4 for
+experts—saving 4× the GPU count compared to the naive approach.
+
+#### Key Rules
+
+1. **Pipeline parallelism (`p`) must match** in both `attn` and `ffn` sections. If `p` is
+   omitted from `ffn`, it inherits from `attn`.
+2. **World sizes must be equal**: `attn_dp × attn_tp × attn_pp × attn_cp` must equal
+   `ffn_dp × ffn_tp × ffn_pp × ffn_ep`.
+3. **Context parallel (`c`) is only valid in `attn`**—it applies exclusively to attention
+   modules.
+4. **Expert parallel (`e`) is only valid in `ffn`**—it applies exclusively to expert
+   modules.
+5. **`ffn` data parallel (`d`) is auto-derived** if omitted:
+   `ffn_dp = world_size / (ffn_ep × ffn_tp × ffn_pp)`.
+
+#### Practical Example: Qwen3 30B-A3B on 32 GPUs
+
+```
+megatron:(attn:d1p4t2c2|ffn:d1p4t1e4)
+```
+
+- **Attention**: 4 pipeline stages, each with TP=2 and CP=2 → 1 × 4 × 2 × 2 = **16
+  GPUs**
+- **FFN/Experts**: 4 pipeline stages, each with TP=1 and EP=4 → 1 × 4 × 1 × 4 = **16
+  GPUs**
+- Same 16 GPUs are reused for both; with DP=2 replicas: **32 GPUs total**
+
+```bash
+actor.backend=megatron:(attn:d2p4t2c2|ffn:d2p4t1e4)  # 32 GPUs
+```
+
+#### When to Use Parallel Folding
+
+- Your model is MoE **and** you need Context Parallelism for long sequences.
+- You want to use Expert Parallelism without multiplying GPU requirements by `CP × EP`.
+- You need fine-grained control over TP for attention vs. expert modules (expert layers
+  often need less TP than attention layers).
+
 **Tuning Guides:**
 
 - [Megatron Performance Best Practice](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core/transformer/moe#performance-best-practice)
