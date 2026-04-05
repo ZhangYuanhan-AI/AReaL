@@ -217,3 +217,104 @@ construction, gradient reduction algorithms, ring attention mechanics.
 - MoE with many experts → add EP
 - MoE + long sequences → use parallel folding (hybrid syntax)
 - MoE training instability → set `use_deterministic_algorithms=True`
+
+---
+
+## 10. FFN Weight Shape & TP/EP Sharding
+
+### FFN Weight Matrices (Per Expert)
+
+Each expert (or the single FFN in a dense model) has 3 weight matrices:
+
+```
+W_gate: (hidden_dim × intermediate_dim)    "gate projection"
+W_up:   (hidden_dim × intermediate_dim)    "up projection"
+W_down: (intermediate_dim × hidden_dim)    "down projection"
+
+Forward:  output = W_down(SiLU(W_gate(x)) × W_up(x))
+```
+
+Concrete example (Qwen3-30B-A3B):
+```
+hidden_dim = 4096, intermediate_dim = 2048, num_experts = 128
+Per expert: 3 × (4096 × 2048) = 24M params ≈ 48MB (bf16)
+All experts: 128 × 48MB ≈ 6.1GB per layer
+```
+
+MoE trade-off: each expert is small, only top-K (usually 2) are active per token.
+More total params (knowledge capacity), same compute per token (speed).
+
+### EP Shards Experts Across GPUs
+
+```
+Without EP: every GPU holds ALL 64 experts → 3.2GB per GPU
+With EP=4:  each GPU holds 16 experts → 800MB per GPU
+
+  GPU 0: experts 0-15
+  GPU 1: experts 16-31
+  GPU 2: experts 32-47
+  GPU 3: experts 48-63
+```
+
+### TP Shards Each Expert's Weights Within a GPU
+
+```
+W_gate: (4096 × 2048)  with TP=2:
+  GPU 0: W_gate[:, :1024]  → (4096 × 1024)   ← column split
+  GPU 1: W_gate[:, 1024:]  → (4096 × 1024)
+
+W_down: (2048 × 4096)  with TP=2:
+  GPU 0: W_down[:1024, :]  → (1024 × 4096)   ← row split
+  GPU 1: W_down[1024:, :]  → (1024 × 4096)
+
+Each GPU computes partial result → all-reduce (sum) → correct full output.
+```
+
+Column split for W_gate/W_up, row split for W_down — so they compose naturally
+with a single all-reduce at the end.
+
+### EP + TP Combined
+
+```
+EP: "which GPU holds which experts"           (fewer experts per GPU)
+TP: "which GPU holds which part of one expert" (smaller expert per GPU)
+
+64 experts, EP=4, ETP=2:
+  Group 0, GPU 0: experts 0-15, left half of weights
+  Group 0, GPU 1: experts 0-15, right half of weights
+  Group 1, GPU 2: experts 16-31, left half
+  Group 1, GPU 3: experts 16-31, right half
+  ...
+  Total: EP × ETP = 4 × 2 = 8 GPUs for expert layers
+
+                    EP (across experts)
+                ┌──────────┬──────────┐
+                │ exp 0-15 │ exp 16-31│ ...
+                └────┬─────┴────┬─────┘
+                     │          │
+              TP (within each expert)
+              ┌──────┴──┐ ┌────┴────┐
+              │left half│ │left half│
+              │GPU 0    │ │GPU 2   │
+              ├─────────┤ ├────────┤
+              │right half│ │right half│
+              │GPU 1    │ │GPU 3   │
+              └─────────┘ └────────┘
+```
+
+### Router Weight Is Independent
+
+```
+Router:    W_router (hidden_dim × num_experts) = (4096 × 128) ≈ 1MB
+           → NOT sharded by EP, every GPU has the full copy
+           → must be on every GPU because every token needs all expert scores
+
+Expert FFN: W_gate, W_up, W_down per expert ≈ 48MB each
+           → sharded by EP across GPUs
+```
+
+Flow:
+1. All GPUs compute router scores (full W_router)
+2. All-to-all: send tokens to GPUs holding selected experts
+3. Each GPU computes local expert FFN (sharded weights)
+4. All-to-all back: return results
